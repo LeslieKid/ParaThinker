@@ -63,9 +63,28 @@ class ParallelCoTsDataCollator(DataCollatorForSeq2Seq):
     special_token_ablation = False
     attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "eager"
     compute_dtype: "torch.dtype" = torch.bfloat16
-    think_token_ids = [(151665 + off * 2) for off in range(9)] # <think1> ~ <think8> + <summary>
-    extra_think_token_ids = [151665 + 6*2, 151665 + 7*2]
+    think_token_ids: List[int] = field(init=False)
+    extra_think_token_ids: List[int] = field(init=False)
+    summary_token_id: int = field(init=False)
     extrapolation_probs: List[float] = field(default_factory=lambda: [0.3, 0.7]) # [apply_extra, don't_apply_extra], used for Extensible Special Tokens Training
+
+    def __post_init__(self):
+        super_post_init = getattr(super(), "__post_init__", None)
+        if callable(super_post_init):
+            super_post_init()
+
+        special_start_tokens = [f"<think{i}>" for i in range(1, 9)] + ["<summary>"]
+        token_ids: List[int] = []
+        for token in special_start_tokens:
+            token_id = self.tokenizer.convert_tokens_to_ids(token)
+            if token_id in {self.tokenizer.unk_token_id, None}:
+                raise ValueError(f"Special token {token} is not found in tokenizer vocabulary.")
+            token_ids.append(token_id)
+
+        self.think_token_ids = token_ids
+        # Use <think7> and <think8> as extra tokens for extrapolation training
+        self.extra_think_token_ids = token_ids[6:8]
+        self.summary_token_id = token_ids[-1]
     
     def __call__(self, features: List[Dict[str, Any]]):
         # Get the basic batch from parent
@@ -97,6 +116,9 @@ class ParallelCoTsDataCollator(DataCollatorForSeq2Seq):
                     random_indices = random.sample(range(1, len(think_start_indices) - 1), 2)
                 else:
                     print("WARNING: Do not apply extra, because of a single cot only, Skipping")
+                    break
+                if len(self.extra_think_token_ids) < 2:
+                    print("WARNING: Not enough extra think tokens configured, skipping extrapolation")
                     break
                 extra_token_ids = random.sample(self.extra_think_token_ids, 2)
                 assert len(extra_token_ids) == 2
@@ -136,7 +158,7 @@ class ParallelCoTsDataCollator(DataCollatorForSeq2Seq):
                     assert (think_start_tokens[idx] - self.think_token_ids[0]) % 2 == 0
                     batch["seg_ids"][b, current_think_idx:next_think_idx] = (think_start_tokens[idx] - self.think_token_ids[0]) // 2 + 1
                     if idx == (len(think_start_indices)-2):
-                        assert batch["input_ids"][b, think_start_indices[idx+1]].item() == 151681
+                        assert batch["input_ids"][b, think_start_indices[idx+1]].item() == self.summary_token_id
                         offset = next_think_idx
                         batch["position_ids"][b, next_think_idx:] += (summary_start_pos - offset)
                         # Set summary segment id equals to 0
