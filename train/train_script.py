@@ -74,6 +74,44 @@ def load_openr1_math_dataset(
     return dataset_dict
 
 
+def retokenize_for_target_model(
+    dataset_dict: Dict[str, Dataset],
+    source_tokenizer: AutoTokenizer,
+    target_tokenizer: AutoTokenizer,
+    max_length: int,
+) -> Dict[str, Dataset]:
+    """Retokenize Qwen-tokenized dataset for a target tokenizer (e.g., Llama)."""
+
+    def _map_batch(examples):
+        texts = source_tokenizer.batch_decode(
+            examples["input_ids"], skip_special_tokens=False
+        )
+        tokenized = target_tokenizer(
+            texts,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+        )
+        return {
+            "input_ids": tokenized["input_ids"],
+            "attention_mask": tokenized["attention_mask"],
+            "labels": tokenized["input_ids"],
+        }
+
+    processed = {}
+    for split, ds in dataset_dict.items():
+        if ds is None:
+            processed[split] = None
+            continue
+        processed[split] = ds.map(
+            _map_batch,
+            batched=True,
+            remove_columns=ds.column_names,
+        )
+        logger.info(f"Retokenized split {split}: {len(processed[split])} samples")
+    return processed
+
+
 def main():
     model_args, data_args, training_args, finetuning_args, generating_args = get_train_args()
     model_args.resize_vocab = True
@@ -89,6 +127,18 @@ def main():
         tokenizer=tokenizer,
         add_special_tokens=True,
     )
+
+    # If training Llama models, retokenize dataset that was pretokenized with Qwen.
+    model_name_lower = model_args.model_name_or_path.lower()
+    if "llama" in model_name_lower and any("input_ids" in ds.column_names for ds in dataset.values() if ds is not None):
+        logger.info("Detected Llama target model; retokenizing dataset from Qwen tokens.")
+        qwen_tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+        dataset = retokenize_for_target_model(
+            dataset_dict=dataset,
+            source_tokenizer=qwen_tokenizer,
+            target_tokenizer=tokenizer,
+            max_length=model_args.model_max_length,
+        )
     
     # Get model for training
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
